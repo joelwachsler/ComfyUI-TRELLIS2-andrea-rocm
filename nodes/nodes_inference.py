@@ -142,10 +142,9 @@ Returns mesh, shape_slat (for texture generation), and subs (subdivision guides)
                 max_num_tokens=max_tokens,
             )
 
-        # Convert to trimesh with Y-up -> Z-up coordinate swap
+        # TRIMESH stays in internal Z-up (conversion to Y-up happens only at export)
         vertices = mesh_verts.numpy().astype(np.float32)
         faces = mesh_faces.numpy()
-        vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
         mesh = Trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
         return io.NodeOutput(mesh, shape_slat_data, subs_data)
@@ -581,10 +580,9 @@ Parameters:
                 max_num_tokens=max_tokens,
             )
 
-        # Convert to trimesh with Y-up -> Z-up coordinate swap
+        # TRIMESH stays in internal Z-up (conversion to Y-up happens only at export)
         vertices = mesh_verts.numpy().astype(np.float32)
         faces = mesh_faces.numpy()
-        vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
         mesh = Trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
         return io.NodeOutput(mesh, shape_slat_data, subs_data)
@@ -636,11 +634,7 @@ Parameters:
 
             device = comfy.model_management.get_torch_device()
 
-            # Convert Z-up -> Y-up for cumesh, then back
-            verts_yup = vertices.copy()
-            verts_yup[:, 1], verts_yup[:, 2] = vertices[:, 2].copy(), -vertices[:, 1].copy()
-
-            verts_t = torch.tensor(verts_yup, dtype=torch.float32).to(device)
+            verts_t = torch.tensor(vertices, dtype=torch.float32).to(device)
             faces_t = torch.tensor(faces, dtype=torch.int32).to(device)
 
             cumesh = CuMesh.CuMesh()
@@ -657,9 +651,6 @@ Parameters:
             out_v, out_f = cumesh.read()
             vertices = out_v.cpu().numpy()
             faces = out_f.cpu().numpy()
-
-            # Y-up -> Z-up
-            vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
 
             del verts_t, faces_t, cumesh
             comfy.model_management.soft_empty_cache()
@@ -813,10 +804,9 @@ views participate in blending.""",
                 blend_temperature=blend_temperature,
             )
 
-        # Convert to trimesh with Y-up -> Z-up coordinate swap
+        # TRIMESH stays in internal Z-up (conversion to Y-up happens only at export)
         vertices = mesh_verts.numpy().astype(np.float32)
         faces = mesh_faces.numpy()
-        vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
         mesh = Trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
         return io.NodeOutput(mesh, shape_slat_data, subs_data)

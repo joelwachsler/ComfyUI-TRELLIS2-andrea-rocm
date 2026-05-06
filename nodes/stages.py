@@ -42,22 +42,16 @@ TEXTURE_RESOLUTION_MAP = {
 
 def _preprocess_mesh(vertices: torch.Tensor, faces: torch.Tensor):
     """
-    Center and scale a mesh to [-0.5, 0.5]^3, convert Z-up (ComfyUI) to Y-up (internal).
+    Center and scale a mesh to [-0.5, 0.5]^3.
 
     Args:
-        vertices: (N, 3) float tensor, Z-up coordinate system
+        vertices: (N, 3) float tensor in Z-up coordinate system
         faces: (M, 3) int tensor
 
     Returns:
-        (vertices, faces) in internal Y-up coordinate system, scaled to [-0.5, 0.5]^3
+        (vertices, faces) centered and scaled to [-0.5, 0.5]^3
     """
     verts = vertices.clone().float()
-
-    # Convert Z-up -> Y-up: y_new = z_old, z_new = -y_old
-    y_old = verts[:, 1].clone()
-    z_old = verts[:, 2].clone()
-    verts[:, 1] = z_old
-    verts[:, 2] = -y_old
 
     # Center and scale to [-0.5, 0.5]^3
     vmin = verts.min(dim=0).values
@@ -157,6 +151,7 @@ def _get_trellis2_models_dir():
 def _init_config():
     """Parse pipeline.json once and resolve all model paths to local files."""
     global _pipeline_config, _model_paths
+    import comfy.utils
 
     if _pipeline_config is not None:
         return
@@ -172,6 +167,10 @@ def _init_config():
 
     with open(config_file, 'r') as f:
         _pipeline_config = json.load(f)['args']
+
+    # Count total models to download for progress bar (+1 for shape_slat_encoder)
+    total_models = len(_pipeline_config['models']) + 1
+    pbar = comfy.utils.ProgressBar(total_models)
 
     # Resolve all model paths to local safetensors files
     for key, model_path in _pipeline_config['models'].items():
@@ -200,6 +199,7 @@ def _init_config():
             hf_hub_download(repo_id, f"{model_name}.safetensors", local_dir=models_dir)
             print(f"[TRELLIS2] Downloaded {model_name}", flush=True)
             _model_paths[key] = local_weights
+        pbar.update(1)
 
     # Register shape_slat_encoder (not in pipeline.json but needed for mesh encoding)
     if 'shape_slat_encoder' not in _model_paths:
@@ -214,6 +214,7 @@ def _init_config():
             hf_hub_download("microsoft/TRELLIS.2-4B", f"{encoder_model_name}.safetensors", local_dir=models_dir)
             print(f"[TRELLIS2] Downloaded {encoder_model_name}", flush=True)
         _model_paths['shape_slat_encoder'] = local_weights
+    pbar.update(1)
 
     print(f"[TRELLIS2] Config loaded: {len(_model_paths)} models registered", flush=True)
 
@@ -953,6 +954,7 @@ def run_shape_generation(
     comfy.model_management.soft_empty_cache()
 
     mesh = meshes[0]
+    mesh.fill_holes()  # match original decode_latent()
 
     # Serialize shape_slat and subs to CPU — they're huge sparse tensors
     # on GPU that aren't needed for mesh post-processing.

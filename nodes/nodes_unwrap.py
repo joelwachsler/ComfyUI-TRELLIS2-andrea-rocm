@@ -81,17 +81,13 @@ Parameters:
         torch.cuda.reset_peak_memory_stats()
         _log_vram("Simplify Start")
 
-        # Convert to torch tensors
+        # Convert to torch tensors (TRIMESH is already in internal Z-up)
         vertices = torch.tensor(trimesh.vertices, dtype=torch.float32).to(device)
         faces = torch.tensor(trimesh.faces, dtype=torch.int32).to(device)
 
-        # Undo coordinate conversion if needed (Z-up back to Y-up)
-        vertices_orig = vertices.clone()
-        vertices_orig[:, 1], vertices_orig[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
-
         # Initialize CuMesh
         cumesh = CuMesh.CuMesh()
-        cumesh.init(vertices_orig, faces)
+        cumesh.init(vertices, faces)
         logger.info(f"Initial: {cumesh.num_vertices} vertices, {cumesh.num_faces} faces")
         _log_vram("After CuMesh.init")
 
@@ -149,10 +145,7 @@ Parameters:
         vertices_np = out_vertices.cpu().numpy()
         faces_np = out_faces.cpu().numpy()
 
-        # Convert back to Z-up
-        vertices_np[:, 1], vertices_np[:, 2] = -vertices_np[:, 2].copy(), vertices_np[:, 1].copy()
-
-        # Build new trimesh
+        # Build new trimesh (stays in internal Z-up)
         result = Trimesh.Trimesh(
             vertices=vertices_np,
             faces=faces_np,
@@ -162,7 +155,7 @@ Parameters:
         logger.info(f"Simplify complete: {len(result.vertices)} vertices, {len(result.faces)} faces")
 
         # Clean up GPU memory
-        del vertices, faces, vertices_orig, out_vertices, out_faces, cumesh
+        del vertices, faces, out_vertices, out_faces, cumesh
         gc.collect()
         comfy.model_management.soft_empty_cache()
         _log_vram("After cleanup")
@@ -225,15 +218,11 @@ TIP: Simplify mesh first! UV unwrapping 10M faces takes forever.""",
         vertices = torch.tensor(trimesh.vertices, dtype=torch.float32).to(device)
         faces = torch.tensor(trimesh.faces, dtype=torch.int32).to(device)
 
-        # Undo coord conversion (Z-up back to Y-up)
-        vertices_orig = vertices.clone()
-        vertices_orig[:, 1], vertices_orig[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
-
         chart_cone_angle_rad = np.radians(chart_cone_angle)
 
-        # Initialize CuMesh
+        # Initialize CuMesh (TRIMESH is already in internal Z-up)
         cumesh = CuMesh.CuMesh()
-        cumesh.init(vertices_orig, faces)
+        cumesh.init(vertices, faces)
 
         # UV Unwrap
         logger.info("Unwrapping UVs...")
@@ -256,12 +245,7 @@ TIP: Simplify mesh first! UV unwrapping 10M faces takes forever.""",
         cumesh.compute_vertex_normals()
         out_normals = cumesh.read_vertex_normals()[out_vmaps.to(device)].cpu().numpy()
 
-        # Convert to Z-up
-        out_vertices[:, 1], out_vertices[:, 2] = -out_vertices[:, 2].copy(), out_vertices[:, 1].copy()
-        out_normals[:, 1], out_normals[:, 2] = -out_normals[:, 2].copy(), out_normals[:, 1].copy()
-        out_uvs[:, 1] = 1 - out_uvs[:, 1]
-
-        # Build trimesh with UVs
+        # Build trimesh with UVs (stays in internal Z-up)
         result = Trimesh.Trimesh(
             vertices=out_vertices,
             faces=out_faces,
@@ -274,7 +258,7 @@ TIP: Simplify mesh first! UV unwrapping 10M faces takes forever.""",
         logger.info(f"UV Unwrap complete: {len(result.vertices)} vertices, {len(result.faces)} faces")
 
         # Clean up GPU memory
-        del vertices, faces, vertices_orig, cumesh
+        del vertices, faces, cumesh
         gc.collect()
         comfy.model_management.soft_empty_cache()
 
@@ -298,19 +282,30 @@ CuMesh session for efficiency.
 Output mesh has UVs and normals ready for Rasterize PBR.""",
             inputs=[
                 io.Custom("TRIMESH").Input("trimesh"),
+                # 1. Remesh or simplify
+                io.DynamicCombo.Input("remesh", options=[
+                    io.DynamicCombo.Option("off", [
+                        io.Boolean.Input("fill_holes", default=True),
+                        io.Float.Input("fill_holes_perimeter", default=0.03, min=0.001, max=0.5, step=0.001),
+                    ]),
+                    io.DynamicCombo.Option("on", [
+                        io.Float.Input("remesh_band", default=1.0, min=0.1, max=5.0, step=0.1),
+                        io.Boolean.Input("remove_inner_faces", default=False),
+                    ]),
+                ]),
+                # 3. Floater removal
+                io.Float.Input("floater_threshold", default=1e-3, min=0.0, max=0.1, step=0.001, optional=True,
+                    tooltip="Area threshold for removing small disconnected components. 0 = disabled."),
+                # 4. Simplification
                 io.Int.Input("target_face_count", default=500000, min=1000, max=5000000, step=1000),
-                io.Boolean.Input("fill_holes", default=True, optional=True),
-                io.Float.Input("fill_holes_perimeter", default=0.03, min=0.001, max=0.5, step=0.001, optional=True),
-                io.Boolean.Input("remesh", default=False, optional=True),
-                io.Float.Input("remesh_band", default=1.0, min=0.1, max=5.0, step=0.1, optional=True),
-                io.Boolean.Input("remove_inner_faces", default=False, optional=True),
-                io.Int.Input("min_component_faces", default=0, min=0, max=100000, optional=True),
+                # 5. Weld vertices
+                io.Boolean.Input("weld_vertices", default=True, optional=True),
+                io.Int.Input("weld_digits", default=4, min=1, max=8, optional=True),
+                # 6. UV unwrap
                 io.Float.Input("chart_cone_angle", default=90.0, min=0.0, max=359.9, step=1.0, optional=True),
                 io.Int.Input("chart_refine_iterations", default=0, min=0, max=10, optional=True),
                 io.Int.Input("chart_global_iterations", default=1, min=0, max=10, optional=True),
                 io.Int.Input("chart_smooth_strength", default=1, min=0, max=10, optional=True),
-                io.Boolean.Input("weld_vertices", default=True, optional=True),
-                io.Int.Input("weld_digits", default=4, min=1, max=8, optional=True),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="trimesh"),
@@ -321,35 +316,40 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
     def execute(
         cls,
         trimesh,
+        remesh=None,
+        floater_threshold=1e-3,
         target_face_count=500000,
-        fill_holes=True,
-        fill_holes_perimeter=0.03,
-        remesh=False,
-        remesh_band=1.0,
-        remove_inner_faces=False,
-        min_component_faces=0,
+        weld_vertices=True,
+        weld_digits=4,
         chart_cone_angle=90.0,
         chart_refine_iterations=0,
         chart_global_iterations=1,
         chart_smooth_strength=1,
-        weld_vertices=True,
-        weld_digits=4,
     ):
         import torch
         import cumesh_vb as CuMesh
         import trimesh as Trimesh
 
-        logger.info(f"ProcessMesh: {len(trimesh.vertices)} verts, {len(trimesh.faces)} faces -> target {target_face_count}")
+        # Extract remesh toggle parameters
+        if remesh is None:
+            remesh = {"remesh": "off"}
+        do_remesh = remesh.get("remesh", "off") == "on"
+        remesh_band = remesh.get("remesh_band", 1.0)
+        remove_inner_faces = remesh.get("remove_inner_faces", False)
+        fill_holes = remesh.get("fill_holes", True)
+        fill_holes_perimeter = remesh.get("fill_holes_perimeter", 0.03)
+
+        mode_str = "remesh" if do_remesh else "simplify"
+        logger.info(f"ProcessMesh ({mode_str}): {len(trimesh.vertices)} verts, {len(trimesh.faces)} faces -> target {target_face_count}")
 
         comfy.model_management.throw_exception_if_processing_interrupted()
         device = comfy.model_management.get_torch_device()
         torch.cuda.reset_peak_memory_stats()
         _log_vram("ProcessMesh Start")
 
-        # Convert to torch, Z-up -> Y-up
+        # TRIMESH is already in internal Z-up
         vertices = torch.tensor(trimesh.vertices, dtype=torch.float32).to(device)
         faces = torch.tensor(trimesh.faces, dtype=torch.int32).to(device)
-        vertices[:, 1], vertices[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
 
         import sys
         _ma = torch.cuda.memory_allocated
@@ -366,7 +366,7 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
 
         # 2. Remesh first (reduces 20M+ faces to ~500K) — do this BEFORE
         #    floater removal so we don't OOM building adjacency on the full mesh
-        if remesh:
+        if do_remesh:
             curr_verts, curr_faces = cumesh.read()
 
             aabb = torch.tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], device=device)
@@ -388,39 +388,76 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
             _print(f"After remesh: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
             del curr_verts, curr_faces
 
-        # 3. Remove floaters (now on the smaller remeshed mesh)
-        if min_component_faces > 0:
-            _print(f"Removing floaters (min_component_faces={min_component_faces})...")
-            cumesh.remove_small_connected_components(1e-5)
+        # 3. Remove floaters
+        if floater_threshold > 0:
+            _print(f"Removing floaters (area_threshold={floater_threshold})...")
+            cumesh.remove_small_connected_components(floater_threshold)
             _print(f"After floater removal: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
 
         comfy.model_management.throw_exception_if_processing_interrupted()
 
-        # 3. Cleanup + simplify
-        _print("Cleaning up mesh...")
-        cumesh.remove_duplicate_faces()
-        cumesh.repair_non_manifold_edges()
-        cumesh.remove_small_connected_components(1e-5)
-        cumesh.unify_face_orientations()
+        # 4. Cleanup + simplify (matches original to_glb pipeline)
+        if not do_remesh:
+            # Branch A: 2-pass simplify (original pattern)
+            _print("Cleaning up mesh...")
+            cumesh.remove_duplicate_faces()
+            cumesh.repair_non_manifold_edges()
+            if floater_threshold > 0:
+                cumesh.remove_small_connected_components(floater_threshold)
+            if fill_holes:
+                cumesh.fill_holes(max_hole_perimeter=fill_holes_perimeter)
 
-        _print(f"Simplifying to {target_face_count} faces...")
-        cumesh.simplify(target_face_count, verbose=True)
-        _print(f"After simplify: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
+            _print(f"Simplifying to {target_face_count * 3} faces (pass 1/2)...")
+            cumesh.simplify(target_face_count * 3, verbose=True)
+            _print(f"After pass 1: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
 
-        # 4. Post-simplify cleanup + fill holes
-        _print("Post-simplify cleanup...")
-        cumesh.remove_duplicate_faces()
-        cumesh.repair_non_manifold_edges()
-        cumesh.remove_small_connected_components(1e-5)
-        if fill_holes:
-            _print(f"Filling holes (max_perimeter={fill_holes_perimeter})...")
-            cumesh.fill_holes(max_hole_perimeter=fill_holes_perimeter)
-            _print(f"After fill holes: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
-        cumesh.unify_face_orientations()
+            cumesh.remove_duplicate_faces()
+            cumesh.repair_non_manifold_edges()
+            if floater_threshold > 0:
+                cumesh.remove_small_connected_components(floater_threshold)
+            if fill_holes:
+                cumesh.fill_holes(max_hole_perimeter=fill_holes_perimeter)
+
+            _print(f"Simplifying to {target_face_count} faces (pass 2/2)...")
+            cumesh.simplify(target_face_count, verbose=True)
+            _print(f"After pass 2: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
+
+            cumesh.remove_duplicate_faces()
+            cumesh.repair_non_manifold_edges()
+            if floater_threshold > 0:
+                cumesh.remove_small_connected_components(floater_threshold)
+            if fill_holes:
+                cumesh.fill_holes(max_hole_perimeter=fill_holes_perimeter)
+            cumesh.unify_face_orientations()
+        else:
+            # Branch B: Single simplify after remesh
+            _print(f"Simplifying to {target_face_count} faces...")
+            cumesh.simplify(target_face_count, verbose=True)
+            _print(f"After simplify: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
 
         comfy.model_management.throw_exception_if_processing_interrupted()
 
-        # 5. UV unwrap
+        # 5. Weld vertices (before UV unwrap — welding after UV corrupts seams)
+        if weld_vertices:
+            _print(f"Welding vertices (digits={weld_digits})...")
+            pre_verts = cumesh.num_vertices
+            weld_verts, weld_faces = cumesh.read()
+            weld_mesh = Trimesh.Trimesh(
+                vertices=weld_verts.cpu().numpy(),
+                faces=weld_faces.cpu().numpy(),
+                process=False,
+            )
+            weld_mesh.merge_vertices(digits_vertex=weld_digits)
+            weld_mesh.remove_unreferenced_vertices()
+            weld_mesh.update_faces(weld_mesh.nondegenerate_faces())
+            cumesh.init(
+                torch.tensor(weld_mesh.vertices, dtype=torch.float32).to(device),
+                torch.tensor(weld_mesh.faces, dtype=torch.int32).to(device),
+            )
+            _print(f"After weld: {pre_verts} -> {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
+            del weld_verts, weld_faces, weld_mesh
+
+        # 6. UV unwrap (last step — produces split vertices at seams)
         _print("UV unwrapping...")
         chart_cone_angle_rad = np.radians(chart_cone_angle)
         out_vertices, out_faces, out_uvs, out_vmaps = cumesh.uv_unwrap(
@@ -442,11 +479,7 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
         out_normals = cumesh.read_vertex_normals()[out_vmaps.to(device)].cpu().numpy()
         _print(f"After UV unwrap: {out_vertices.shape[0]} verts, {out_faces.shape[0]} faces")
 
-        # Y-up -> Z-up
-        out_vertices[:, 1], out_vertices[:, 2] = -out_vertices[:, 2].copy(), out_vertices[:, 1].copy()
-        out_normals[:, 1], out_normals[:, 2] = -out_normals[:, 2].copy(), out_normals[:, 1].copy()
-        out_uvs[:, 1] = 1 - out_uvs[:, 1]
-
+        # Output stays in internal Z-up (conversion to Y-up happens only at export)
         result = Trimesh.Trimesh(
             vertices=out_vertices,
             faces=out_faces,
@@ -454,15 +487,6 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
             process=False,
         )
         result.visual = Trimesh.visual.TextureVisuals(uv=out_uvs)
-
-        # 6. Weld vertices
-        if weld_vertices:
-            _print(f"Welding vertices (digits={weld_digits})...")
-            pre_verts = len(result.vertices)
-            result.merge_vertices(merge_tex=True, merge_norm=True, digits_vertex=weld_digits, digits_norm=weld_digits, digits_uv=weld_digits)
-            result.remove_unreferenced_vertices()
-            result.update_faces(result.nondegenerate_faces())
-            _print(f"After weld: removed {pre_verts - len(result.vertices)} verts, now {len(result.vertices)} verts, {len(result.faces)} faces")
 
         _print(f"Done: {len(result.vertices)} verts, {len(result.faces)} faces")
 
@@ -495,6 +519,8 @@ Parameters:
                 io.Custom("TRIMESH").Input("trimesh"),
                 io.Custom("TRELLIS2_VOXELGRID").Input("voxelgrid"),
                 io.Int.Input("texture_size", default=2048, min=512, max=16384, step=512),
+                io.Custom("TRIMESH").Input("original_mesh", optional=True,
+                    tooltip="Original mesh (pre-simplification) for BVH projection. Improves texture accuracy by projecting texel positions back to the original surface."),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="trimesh"),
@@ -507,6 +533,7 @@ Parameters:
         trimesh,
         voxelgrid,
         texture_size=2048,
+        original_mesh=None,
     ):
         import torch
         import cv2
@@ -532,10 +559,6 @@ Parameters:
         vertices = torch.tensor(trimesh.vertices, dtype=torch.float32).to(device)
         faces = torch.tensor(trimesh.faces, dtype=torch.int32).to(device)
         uvs = torch.tensor(trimesh.visual.uv, dtype=torch.float32).to(device)
-
-        # Undo Z-up to Y-up for voxel sampling
-        vertices_yup = vertices.clone()
-        vertices_yup[:, 1], vertices_yup[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
 
         # Get voxel data from dict
         attr_volume = voxelgrid['attrs']
@@ -563,17 +586,22 @@ Parameters:
             grid_size = torch.tensor([1024, 1024, 1024], dtype=torch.int32, device=device)
             voxel_size = (aabb[1] - aabb[0]) / grid_size
 
-        logger.info("Rasterizing in UV space...")
+        mask, valid_pos = _rasterize_uv(vertices, faces, uvs, texture_size, device)
 
-        mask, valid_pos = _rasterize_uv(
-            vertices_yup, faces, uvs, texture_size, device,
-        )
+        # BVH projection: snap texel positions back to original mesh surface
+        if original_mesh is not None:
+            import cumesh_vb as CuMesh
+            orig_verts = torch.tensor(original_mesh.vertices, dtype=torch.float32).to(device)
+            orig_faces = torch.tensor(original_mesh.faces, dtype=torch.int32).to(device)
+            bvh = CuMesh.cuBVH(orig_verts, orig_faces)
+            _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+            orig_tri_verts = orig_verts[orig_faces[face_id.long()]]
+            valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+            del bvh, orig_verts, orig_faces, face_id, uvw, orig_tri_verts
 
-        del vertices_yup
         comfy.model_management.soft_empty_cache()
 
         # Sample voxel attributes for texture pixels
-        logger.info("Sampling voxel attributes...")
         attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=device)
         attrs[mask] = grid_sample_3d(
             attr_volume,
@@ -583,21 +611,19 @@ Parameters:
             mode='trilinear',
         )
 
-        # Sample PBR attributes at vertex positions (Y-up)
+        # Sample PBR attributes at vertex positions (already in internal Z-up)
         logger.info("Sampling vertex PBR attributes...")
-        verts_yup = vertices.clone()
-        verts_yup[:, 1], verts_yup[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
         vertex_pbr_attrs = grid_sample_3d(
             attr_volume,
             torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
             shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-            grid=((verts_yup - aabb[0]) / voxel_size).reshape(1, -1, 3),
+            grid=((vertices - aabb[0]) / voxel_size).reshape(1, -1, 3),
             mode='trilinear',
         )[0]
 
         logger.info("Building PBR textures...")
 
-        del valid_pos, attr_volume, coords, verts_yup
+        del valid_pos, attr_volume, coords
         comfy.model_management.soft_empty_cache()
 
         mask_np = mask.cpu().numpy()
@@ -1036,7 +1062,7 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device):
     mask = rast_face_ids >= 0
 
     _, bary_img = drtk.render(verts_uv, faces.int(), rast_face_ids.unsqueeze(0))
-    # bary_img: [1, 3, H, W] -> [H, W, 3]
+    # bary_img: [N, 3, H, W] -> [H, W, 3]
     bary = bary_img[0].permute(1, 2, 0)
 
     bary_masked = bary[mask]
@@ -1358,6 +1384,8 @@ Supports: GLB, OBJ, PLY, STL, 3MF, DAE""",
 
     @classmethod
     def execute(cls, trimesh, filename_prefix="trellis2", file_format="glb"):
+        import copy
+
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H%M%S")
         filename = f"{filename_prefix}_{timestamp}.{file_format}"
@@ -1366,7 +1394,23 @@ Supports: GLB, OBJ, PLY, STL, 3MF, DAE""",
         output_path = Path(output_dir) / filename
         output_path.parent.mkdir(exist_ok=True)
 
-        trimesh.export(str(output_path), file_type=file_format)
+        # For glTF/GLB formats, convert internal Z-up -> Y-up at export time
+        if file_format in ('glb', 'gltf'):
+            export_mesh = copy.deepcopy(trimesh)
+            verts = export_mesh.vertices.copy()
+            verts[:, 1], verts[:, 2] = verts[:, 2].copy(), -verts[:, 1].copy()
+            export_mesh.vertices = verts
+            if hasattr(export_mesh, 'vertex_normals') and export_mesh.vertex_normals is not None and len(export_mesh.vertex_normals) > 0:
+                normals = export_mesh.vertex_normals.copy()
+                normals[:, 1], normals[:, 2] = normals[:, 2].copy(), -normals[:, 1].copy()
+                export_mesh.vertex_normals = normals
+            if hasattr(export_mesh.visual, 'uv') and export_mesh.visual.uv is not None:
+                uvs = export_mesh.visual.uv.copy()
+                uvs[:, 1] = 1 - uvs[:, 1]
+                export_mesh.visual.uv = uvs
+            export_mesh.export(str(output_path), file_type=file_format)
+        else:
+            trimesh.export(str(output_path), file_type=file_format)
 
         logger.info(f"Exported to: {output_path}")
 

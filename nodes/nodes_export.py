@@ -75,17 +75,17 @@ Parameters:
             comfy.model_management.throw_exception_if_processing_interrupted()
             angle = 2 * math.pi * i / num_views
 
-            # Camera position
+            # Camera position (Z-up coordinate system)
             cam_pos = np.array([
                 center[0] + distance * math.sin(angle),
-                center[1] + 0.3 * distance,
-                center[2] + distance * math.cos(angle)
+                center[1] + distance * math.cos(angle),
+                center[2] + 0.3 * distance,
             ])
 
             # Look at center
             forward = center - cam_pos
             forward = forward / np.linalg.norm(forward)
-            right = np.cross(forward, np.array([0, 1, 0]))
+            right = np.cross(forward, np.array([0, 0, 1]))
             right = right / np.linalg.norm(right)
             up = np.cross(right, forward)
 
