@@ -7,6 +7,31 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log = logging.getLogger("trellis2")
 
+
+def _comfy_tqdm():
+    """tqdm that shows download progress in ComfyUI's UI."""
+    try:
+        import comfy.utils
+        import tqdm as _tqdm_mod
+    except ImportError:
+        return None
+    holder = {"pbar": None, "total": 0, "done": 0}
+    class _T(_tqdm_mod.tqdm):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            if self.total and self.total > 0 and holder["pbar"] is None:
+                holder["total"] = self.total
+                holder["done"] = 0
+                holder["pbar"] = comfy.utils.ProgressBar(self.total)
+        def update(self, n=1):
+            ret = super().update(n)
+            if n and holder["pbar"] and holder["total"] > 0:
+                holder["done"] = min(holder["done"] + n, holder["total"])
+                holder["pbar"].update_absolute(holder["done"], holder["total"])
+            return ret
+    return _T
+
+
 # Model class lookup table: name -> (module, class_name)
 _MODEL_CLASSES = {
     # Sparse Structure
@@ -88,9 +113,9 @@ def from_pretrained(path: str, disk_offload_manager=None, model_key: str = None,
             # Download directly to models folder (no intermediate HF cache)
             from huggingface_hub import hf_hub_download
             log.info(f"Downloading {model_name} config...")
-            hf_hub_download(repo_id, f"{model_name}.json", local_dir=models_dir)
+            hf_hub_download(repo_id, f"{model_name}.json", local_dir=models_dir, tqdm_class=_comfy_tqdm())
             log.info(f"Downloading {model_name} weights (this may take a while)...")
-            hf_hub_download(repo_id, f"{model_name}.safetensors", local_dir=models_dir)
+            hf_hub_download(repo_id, f"{model_name}.safetensors", local_dir=models_dir, tqdm_class=_comfy_tqdm())
             config_file = local_config
             model_file = local_weights
 

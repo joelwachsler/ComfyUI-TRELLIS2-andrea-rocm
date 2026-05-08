@@ -20,6 +20,30 @@ ops = comfy.ops.manual_cast
 log = logging.getLogger("trellis2")
 
 
+def _comfy_tqdm():
+    """tqdm that shows download progress in ComfyUI's UI."""
+    try:
+        import comfy.utils
+        import tqdm as _tqdm_mod
+    except ImportError:
+        return None
+    holder = {"pbar": None, "total": 0, "done": 0}
+    class _T(_tqdm_mod.tqdm):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            if self.total and self.total > 0 and holder["pbar"] is None:
+                holder["total"] = self.total
+                holder["done"] = 0
+                holder["pbar"] = comfy.utils.ProgressBar(self.total)
+        def update(self, n=1):
+            ret = super().update(n)
+            if n and holder["pbar"] and holder["total"] > 0:
+                holder["done"] = min(holder["done"] + n, holder["total"])
+                holder["pbar"].update_absolute(holder["done"], holder["total"])
+            return ret
+    return _T
+
+
 # ---------------------------------------------------------------------------
 # Config (hardcoded for ViT-L, matching the safetensors checkpoint)
 # ---------------------------------------------------------------------------
@@ -311,7 +335,7 @@ class DinoV3FeatureExtractor:
             # (avoids HF cache structure that _find_local_safetensors can't find)
             from huggingface_hub import hf_hub_download
             log.info(f"Downloading DINOv3 model: {actual_model_name}...")
-            hf_hub_download(actual_model_name, "model.safetensors", local_dir=cache_dir)
+            hf_hub_download(actual_model_name, "model.safetensors", local_dir=cache_dir, tqdm_class=_comfy_tqdm())
             local_safetensors = os.path.join(cache_dir, "model.safetensors")
             self.model = _load_dinov3_from_safetensors(local_safetensors)
             log.info("DINOv3 model loaded successfully")
