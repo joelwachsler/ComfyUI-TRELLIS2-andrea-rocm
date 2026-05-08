@@ -1,4 +1,4 @@
-comfy-env==0.3.68
+comfy-env==0.3.69
 comfy-3d-viewers==0.2.44
 comfy-sparse-attn==0.0.9
 trimesh[easy]
