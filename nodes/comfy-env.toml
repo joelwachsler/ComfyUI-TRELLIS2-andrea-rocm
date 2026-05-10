@@ -21,6 +21,7 @@ trimesh = { version = "*", extras = ["easy"] }
 plyfile = "*"
 zstandard = "*"
 psutil = "*"
+einops = "*"
 
 # Image processing
 pillow = ">=9.0.0"
