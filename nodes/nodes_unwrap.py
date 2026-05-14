@@ -374,8 +374,8 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
             scale = (aabb[1] - aabb[0]).max().item()
             resolution = 512
 
-            _print(f"Remeshing (quad DC, resolution={resolution}, band={remesh_band}, remove_inner_faces={remove_inner_faces})...")
-            cumesh.init(*CuMesh.remeshing.remesh_narrow_band_dc_quad(
+            _print(f"Remeshing (DC, resolution={resolution}, band={remesh_band})...")
+            cumesh.init(*CuMesh.remeshing.remesh_narrow_band_dc(
                 curr_verts, curr_faces,
                 center=center,
                 scale=scale * 1.1,
@@ -383,7 +383,6 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
                 band=remesh_band,
                 project_back=0.0,
                 verbose=True,
-                remove_inner_faces=remove_inner_faces,
             ))
             _print(f"After remesh: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
             del curr_verts, curr_faces
