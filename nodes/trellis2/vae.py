@@ -670,7 +670,14 @@ class SparseResBlockC2S3d(nn.Module):
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
 
         # --- TILED PATH: fused conv1->C2S, never materializes full conv1 output ---
-        if self._low_vram and N > 1_000_000:
+        # Requires _partition_octree from flex_gemm_ap which is only in CUDA wheels
+        _can_tile = False
+        try:
+            from flex_gemm_ap.ops.spconv.submanifold_conv3d import _partition_octree
+            _can_tile = True
+        except ImportError:
+            pass
+        if self._low_vram and N > 1_000_000 and _can_tile:
             h, x_feats_cpu = self._tiled_conv1_c2s(h, x, subdiv_binarized)
             del subdiv_binarized
         else:
@@ -1029,7 +1036,7 @@ class SparseUnetVaeDecoder(nn.Module):
                 except Exception:
                     pass
         # Tiled sparse conv for large voxel counts
-        tile_size = 1_000_000 if self._low_vram else 0
+        tile_size = 0
         count = 0
         for module in self.modules():
             if module.__class__.__name__ == 'SparseConv3d':
