@@ -1023,7 +1023,7 @@ def _batched_unsigned_distance(bvh, positions, batch_size=500_000, return_uvw=Fa
 
 
 def _rasterize_uv(vertices, faces, uvs, texture_size, device):
-    """Rasterize mesh in UV space using DRTK and return (mask, valid_pos).
+    """Rasterize mesh in UV space and return (mask, valid_pos).
 
     Args:
         vertices: [V, 3] vertex positions
@@ -1037,6 +1037,20 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device):
         valid_pos: [N, 3] 3D positions for covered pixels
     """
     import torch
+    try:
+        import drtk
+    except ImportError:
+        drtk = None
+
+    if drtk is not None:
+        return _rasterize_uv_drtk(vertices, faces, uvs, texture_size, device)
+    else:
+        logger.warning("drtk not available, using PyTorch-native UV rasterization fallback (slower)")
+        return _rasterize_uv_pytorch(vertices, faces, uvs, texture_size, device)
+
+
+def _rasterize_uv_drtk(vertices, faces, uvs, texture_size, device):
+    import torch
     import drtk
 
     chunk_size = 100_000
@@ -1046,7 +1060,7 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device):
         uvs[:, 0] * S - 0.5,
         uvs[:, 1] * S - 0.5,
         torch.ones(uvs.shape[0], device=device),
-    ], dim=-1).float().unsqueeze(0)  # [1, V, 3]
+    ], dim=-1).float().unsqueeze(0)
 
     rast_face_ids = torch.full((S, S), -1, dtype=torch.int32, device=device)
     for i in range(0, faces.shape[0], chunk_size):
@@ -1061,7 +1075,6 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device):
     mask = rast_face_ids >= 0
 
     _, bary_img = drtk.render(verts_uv, faces.int(), rast_face_ids.unsqueeze(0))
-    # bary_img: [N, 3, H, W] -> [H, W, 3]
     bary = bary_img[0].permute(1, 2, 0)
 
     bary_masked = bary[mask]
@@ -1071,6 +1084,134 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device):
     del verts_uv, rast_face_ids, bary_img, bary, face_verts, bary_masked, face_ids
 
     import comfy.model_management
+    comfy.model_management.soft_empty_cache()
+    return mask, valid_pos
+
+
+def _rasterize_uv_pytorch(vertices, faces, uvs, texture_size, device):
+    import torch
+
+    S = texture_size
+    BLOCK = 32
+    MAX_K = 512
+
+    px_u = uvs[:, 0] * S - 0.5
+    px_v = uvs[:, 1] * S - 0.5
+
+    rast_face_ids = torch.full((S, S), -1, dtype=torch.int32, device=device)
+    rast_bary = torch.zeros((S, S, 3), dtype=torch.float32, device=device)
+    rast_depth = torch.full((S, S), float('inf'), device=device)
+
+    f0 = faces[:, 0].long()
+    f1 = faces[:, 1].long()
+    f2 = faces[:, 2].long()
+    v0x = px_u[f0]; v0y = px_v[f0]
+    v1x = px_u[f1]; v1y = px_v[f1]
+    v2x = px_u[f2]; v2y = px_v[f2]
+
+    bb_xmin = torch.floor(torch.minimum(torch.minimum(v0x, v1x), v2x)).long().clamp(0, S - 1)
+    bb_ymin = torch.floor(torch.minimum(torch.minimum(v0y, v1y), v2y)).long().clamp(0, S - 1)
+    bb_xmax = torch.ceil(torch.maximum(torch.maximum(v0x, v1x), v2x)).long().clamp(0, S - 1)
+    bb_ymax = torch.ceil(torch.maximum(torch.maximum(v0y, v1y), v2y)).long().clamp(0, S - 1)
+
+    tri_det = (v1y - v2y) * (v0x - v2x) + (v2x - v1x) * (v0y - v2y)
+    neg_area = -tri_det.abs() * 0.5
+    degenerate = tri_det.abs() < 1e-8
+
+    for by_start in range(0, S, BLOCK):
+        by_end = min(by_start + BLOCK, S)
+        for bx_start in range(0, S, BLOCK):
+            bx_end = min(bx_start + BLOCK, S)
+            comfy.model_management.throw_exception_if_processing_interrupted()
+
+            overlap = (bb_xmax >= bx_start) & (bb_xmin < bx_end) & \
+                      (bb_ymax >= by_start) & (bb_ymin < by_end) & \
+                      ~degenerate
+
+            overlap_idx = torch.where(overlap)[0]
+            K = overlap_idx.shape[0]
+            if K == 0:
+                continue
+
+            bh = by_end - by_start
+            bw = bx_end - bx_start
+            pgy, pgx = torch.meshgrid(
+                torch.arange(by_start, by_end, device=device, dtype=torch.float32),
+                torch.arange(bx_start, bx_end, device=device, dtype=torch.float32),
+                indexing='ij',
+            )
+            flat_px = pgx.reshape(-1)
+            flat_py = pgy.reshape(-1)
+            N = flat_px.shape[0]
+
+            for k_start in range(0, K, MAX_K):
+                k_end = min(k_start + MAX_K, K)
+                bk = overlap_idx[k_start:k_end]
+                BK = bk.shape[0]
+
+                _v0x = v0x[bk]; _v0y = v0y[bk]
+                _v1x = v1x[bk]; _v1y = v1y[bk]
+                _v2x = v2x[bk]; _v2y = v2y[bk]
+                _neg_area = neg_area[bk]
+
+                ax = _v0x.unsqueeze(0)
+                ay = _v0y.unsqueeze(0)
+                bx_v = _v1x.unsqueeze(0)
+                by_v = _v1y.unsqueeze(0)
+                cx = _v2x.unsqueeze(0)
+                cy = _v2y.unsqueeze(0)
+
+                det = (by_v - cy) * (ax - cx) + (cx - bx_v) * (ay - cy)
+                inv_det = 1.0 / det
+
+                px = flat_px.unsqueeze(1)
+                py = flat_py.unsqueeze(1)
+
+                l0 = ((by_v - cy) * (px - cx) + (cx - bx_v) * (py - cy)) * inv_det
+                l1 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) * inv_det
+                l2 = 1.0 - l0 - l1
+
+                inside = (l0 >= 0) & (l1 >= 0) & (l2 >= 0)
+
+                priority = torch.where(inside, _neg_area.unsqueeze(0).expand(N, BK),
+                                       torch.full((N, BK), float('inf'), device=device))
+                best_k = priority.argmin(dim=1)
+                best_inside = inside[torch.arange(N, device=device), best_k]
+
+                if not best_inside.any():
+                    del l0, l1, l2, inside, priority, best_k
+                    continue
+
+                best_bary0 = l0[torch.arange(N, device=device), best_k]
+                best_bary1 = l1[torch.arange(N, device=device), best_k]
+                best_bary2 = l2[torch.arange(N, device=device), best_k]
+                best_face_global = bk[best_k]
+
+                valid = best_inside
+                vy = flat_py[valid].long()
+                vx = flat_px[valid].long()
+                new_pri = _neg_area[best_k[valid]]
+                better = new_pri < rast_depth[vy, vx]
+
+                if better.any():
+                    vy_b = vy[better]
+                    vx_b = vx[better]
+                    rast_face_ids[vy_b, vx_b] = best_face_global[valid][better].int()
+                    rast_bary[vy_b, vx_b, 0] = best_bary0[valid][better]
+                    rast_bary[vy_b, vx_b, 1] = best_bary1[valid][better]
+                    rast_bary[vy_b, vx_b, 2] = best_bary2[valid][better]
+                    rast_depth[vy_b, vx_b] = new_pri[better]
+
+                del l0, l1, l2, inside, priority, best_k, best_inside
+                del best_bary0, best_bary1, best_bary2, best_face_global, valid, vy, vx, new_pri, better
+
+    mask = rast_face_ids >= 0
+    face_ids = rast_face_ids[mask].long()
+    face_verts = vertices[faces[face_ids]]
+    bary_masked = rast_bary[mask]
+    valid_pos = (face_verts * bary_masked.unsqueeze(-1)).sum(dim=1)
+
+    del rast_face_ids, rast_bary, rast_depth
     comfy.model_management.soft_empty_cache()
     return mask, valid_pos
 
@@ -1413,7 +1554,7 @@ Supports: GLB, OBJ, PLY, STL, 3MF, DAE""",
 
         logger.info(f"Exported to: {output_path}")
 
-        return io.NodeOutput(str(output_path))
+        return io.NodeOutput(filename)
 
 
 NODE_CLASS_MAPPINGS = {
